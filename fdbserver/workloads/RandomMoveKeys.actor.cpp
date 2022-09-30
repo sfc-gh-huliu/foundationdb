@@ -244,4 +244,4 @@ struct MoveKeysWorkload : FailureInjectionWorkload {
 };
 
 WorkloadFactory<MoveKeysWorkload> MoveKeysWorkloadFactory("RandomMoveKeys");
-FailureInjectorFactory<MoveKeysWorkload> MoveKeysFailureInjectionFactory;
+// FailureInjectorFactory<MoveKeysWorkload> MoveKeysFailureInjectionFactory;

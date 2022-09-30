@@ -132,4 +132,4 @@ struct RollbackWorkload : FailureInjectionWorkload {
 };
 
 WorkloadFactory<RollbackWorkload> RollbackWorkloadFactory("Rollback");
-FailureInjectorFactory<RollbackWorkload> RollbackFailureInjectorFactory;
+// FailureInjectorFactory<RollbackWorkload> RollbackFailureInjectorFactory;
