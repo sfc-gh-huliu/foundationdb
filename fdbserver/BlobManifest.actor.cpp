@@ -241,6 +241,18 @@ public:
 		}
 	}
 
+	// Append rows to the splitter
+	void append(RangeResult rows) {
+		ASSERT(!closed_);
+		rows_.arena().dependsOn(rows.arena());
+		rows_.append(rows_.arena(), rows.begin(), rows.size());
+		totalRows_ += rows.size();
+		logicalSize_ += rows.expectedSize();
+		if (logicalSize_ > SERVER_KNOBS->BLOB_RESTORE_MANIFEST_FILE_MAX_SIZE) {
+			flushNext();
+		}
+	}
+
 	int64_t totalBytes() { return totalBytes_; }
 
 	// Close the splitter. No more data should be added after
@@ -367,17 +379,12 @@ public:
 private:
 	// Read system keys and write to manifest files
 	ACTOR static Future<int64_t> dump(Reference<BlobManifestDumper> self) {
-		state Reference<BlobManifestFileSplitter> splitter = self->fileSplitter_;
-		state Transaction tr(self->db_);
 		loop {
-			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
-			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			try {
-				state std::vector<KeyRangeRef> ranges = {
+				std::vector<KeyRangeRef> ranges = {
 					blobGranuleMappingKeys, // Map granule to workers. Track the active granules
-					blobGranuleHistoryKeys, // Map granule to its parents and parent bundaries. for time-travel read
-					blobGranuleFileKeys, // Map a granule version to granule files. Track files for a granule
+					// blobGranuleHistoryKeys, // Map granule to its parents and parent bundaries. for time-travel read
+					// blobGranuleFileKeys, // Map a granule version to granule files. Track files for a granule
 					blobRangeKeys // Key ranges managed by blob
 				};
 				// tenant metadata
@@ -386,41 +393,92 @@ private:
 				}
 				// last updated version for table metadata
 				ranges.push_back(KeyRangeRef(metadataVersionKey, metadataVersionKeyEnd));
-
-				for (auto range : ranges) {
-					state GetRangeLimits limits(SERVER_KNOBS->BLOB_MANIFEST_RW_ROWS);
-					limits.minRows = 0;
-					state KeySelectorRef begin = firstGreaterOrEqual(range.begin);
-					state KeySelectorRef end = firstGreaterOrEqual(range.end);
-					loop {
-						state RangeResult result = wait(tr.getRange(begin, end, limits, Snapshot::True));
-						for (auto& row : result) {
-							splitter->append(KeyValueRef(row.key, row.value));
-						}
-						if (!result.more) {
-							break;
-						}
-						if (result.readThrough.present()) {
-							begin = firstGreaterOrEqual(result.readThrough.get());
-						} else {
-							begin = firstGreaterThan(result.back().key);
-						}
-					}
-				}
-
-				// store the read vesion
-				Version readVersion = wait(tr.getReadVersion());
-				Value versionEncoded = BinaryWriter::toValue(readVersion, Unversioned());
-				splitter->append(KeyValueRef(blobManifestVersionKey, versionEncoded));
+				wait(dumpRange(self, ranges));
+				wait(dumpRange(self, blobGranuleHistoryKeys));
+				wait(dumpRange(self, blobGranuleFileKeys));
 
 				// last flush for in-memory data
-				wait(BlobManifestFileSplitter::close(splitter));
-				return splitter->totalBytes();
+				wait(BlobManifestFileSplitter::close(self->fileSplitter_));
+				return self->fileSplitter_->totalBytes();
 			} catch (Error& e) {
 				TraceEvent("BlobManfiestDumpError").error(e).log();
 				dprint("Manifest dumping error {}\n", e.what());
-				wait(tr.onError(e));
-				wait(BlobManifestFileSplitter::reset(splitter));
+				wait(BlobManifestFileSplitter::reset(self->fileSplitter_));
+			}
+		}
+	}
+
+	ACTOR static Future<Void> dumpRange(Reference<BlobManifestDumper> self, std::vector<KeyRangeRef> ranges) {
+		state Transaction tr(self->db_);
+		loop {
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			for (auto range : ranges) {
+				try {
+					state PromiseStream<RangeResult> rows;
+					state Future<Void> stream = tr.getRangeStream(rows, range, GetRangeLimits(), Snapshot::True);
+					loop {
+						RangeResult result = waitNext(rows.getFuture());
+						self->fileSplitter_->append(result);
+					}
+				} catch (Error& e) {
+					if (e.code() == error_code_end_of_stream) {
+						return Void();
+					}
+					throw;
+				}
+			}
+			Version readVersion = wait(tr.getReadVersion());
+			Value versionEncoded = BinaryWriter::toValue(readVersion, Unversioned());
+			self->fileSplitter_->append(KeyValueRef(blobManifestVersionKey, versionEncoded));
+		}
+	}
+
+	ACTOR static Future<Void> dumpRange(Reference<BlobManifestDumper> self, KeyRangeRef range) {
+		state KeySelectorRef begin = firstGreaterOrEqual(range.begin);
+		state KeySelectorRef end = firstGreaterOrEqual(range.end);
+		loop {
+			Standalone<KeySelectorRef> next = wait(dumpRange(self, begin, end));
+			if (next.isDefinitelyGreater(end.getKey())) {
+				return Void();
+			}
+			begin = next;
+		}
+	}
+
+	ACTOR static Future<Standalone<KeySelectorRef>> dumpRange(Reference<BlobManifestDumper> self,
+	                                                          KeySelectorRef begin,
+	                                                          KeySelectorRef end) {
+		state Transaction tr(self->db_);
+		state int count = 0;
+		loop {
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			try {
+				state GetRangeLimits limits(SERVER_KNOBS->BLOB_MANIFEST_RW_ROWS);
+				limits.minRows = 0;
+				// state KeySelectorRef begin = firstGreaterOrEqual(range.begin);
+				// state KeySelectorRef end = firstGreaterOrEqual(range.end);
+				loop {
+					RangeResult result = wait(tr.getRange(begin, end, limits, Snapshot::True));
+					self->fileSplitter_->append(result);
+					count += result.size();
+					if (!result.more) {
+						return end;
+					}
+					if (result.readThrough.present()) {
+						begin = firstGreaterOrEqual(result.readThrough.get());
+					} else {
+						begin = firstGreaterThan(result.back().key);
+					}
+					if (count > 2000) {
+						return begin;
+					}
+				}
+			} catch (Error& e) {
+				throw;
 			}
 		}
 	}
